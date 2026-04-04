@@ -1,0 +1,48 @@
+service: ecommerce-lambda-backend
+frameworkVersion: "4"
+
+useDotenv: true
+
+plugins:
+  - serverless-offline
+
+provider:
+  name: aws
+  runtime: nodejs20.x
+  region: us-east-1
+  stage: dev
+  environment:
+    DB_HOST: ${env:DB_HOST}
+    DB_USER: ${env:DB_USER}
+    DB_PASSWORD: ${env:DB_PASSWORD}
+    DB_NAME: ${env:DB_NAME}
+    JWT_SECRET: ${env:JWT_SECRET}
+
+functions:
+  healthCheck:
+    handler: src/handlers/healthCheck.handler
+    events:
+      - httpApi:
+          path: /health
+          method: get
+
+  createOrder:
+    handler: src/handlers/createOrder.handler
+    events:
+      - httpApi:
+          path: /orders
+          method: post
+
+  markOrderPaid:
+    handler: src/handlers/markOrderPaid.handler
+    events:
+      - httpApi:
+          path: /orders/{orderId}/paid
+          method: post
+
+  getRecommendations:
+    handler: src/handlers/getRecommendations.handler
+    events:
+      - httpApi:
+          path: /customers/{customerId}/recommendations
+          method: get

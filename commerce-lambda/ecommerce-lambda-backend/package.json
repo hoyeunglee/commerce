@@ -1,0 +1,23 @@
+{
+  "name": "ecommerce-lambda-backend",
+  "version": "1.0.0",
+  "main": "index.js",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "description": "",
+  "dependencies": {
+    "bcryptjs": "^3.0.3",
+    "jsonwebtoken": "^9.0.3",
+    "pg": "^8.20.0",
+    "pg-format": "^1.0.4",
+    "uuid": "^13.0.0"
+  },
+  "devDependencies": {
+    "serverless": "^4.33.3",
+    "serverless-offline": "^14.5.0"
+  }
+}
