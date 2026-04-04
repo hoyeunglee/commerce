@@ -9,16 +9,27 @@ import SwiftUI
 
 struct ProductListView: View {
     @Environment(\.appState) private var app
+    @State private var isShowingCartLimitAlert: Bool = false
 
     var body: some View {
         List {
             Section("Products") {
-                ForEach(1..<6) { idx in
+                ForEach(app.products) { product in
                     HStack {
-                        Text("Product #\(idx)")
+                        VStack(alignment: .leading) {
+                            Text(product.name)
+                            Text("$\(product.price, specifier: "%.2f")")
+                                .font(.footnote)
+                                .foregroundStyle(.secondary)
+                        }
                         Spacer()
                         Button("Add to Cart") {
-                            app.path.append(.cart)
+                            let added = app.addToCart(product: product)
+                            if added {
+                                app.path.append(.cart)
+                            } else {
+                                isShowingCartLimitAlert = true
+                            }
                         }
                         .buttonStyle(.bordered)
                     }
@@ -40,6 +51,11 @@ struct ProductListView: View {
                 }
             }
         }
+        .alert("Cart Limit Reached", isPresented: $isShowingCartLimitAlert) {
+            Button("OK", role: .cancel) {}
+        } message: {
+            Text("You can add up to 10 items in your cart.")
+        }
     }
 }
 
@@ -47,3 +63,4 @@ struct ProductListView: View {
     ProductListView()
         .environment(\.appState, AppState())
 }
+
