@@ -1,0 +1,589 @@
+-- ============================================================================
+--  HIGH-COMPLIANCE E-COMMERCE DATABASE FOR AMAZON AURORA POSTGRESQL
+--  - Core commerce schema
+--  - Analytics & reporting schema
+--  - Audit & security posture
+--  - Lambda-friendly functions
+-- ============================================================================
+-- Assumptions:
+--  - Aurora PostgreSQL (v14+)
+--  - Network, encryption (KMS), backups, and IAM handled at AWS level
+--  - No raw card data stored (use external PSP tokens)
+-- ============================================================================
+
+-- ============================================================================
+-- 1. EXTENSIONS & BASE SETUP
+-- ============================================================================
+CREATE EXTENSION IF NOT EXISTS "uuid-ossp";
+CREATE EXTENSION IF NOT EXISTS pgcrypto;
+
+-- Optional: for basic similarity / recommendation heuristics
+CREATE EXTENSION IF NOT EXISTS pg_trgm;
+
+-- ============================================================================
+-- 2. SCHEMAS
+-- ============================================================================
+CREATE SCHEMA IF NOT EXISTS core;
+CREATE SCHEMA IF NOT EXISTS analytics;
+CREATE SCHEMA IF NOT EXISTS audit;
+
+-- ============================================================================
+-- 3. CORE TABLES
+-- ============================================================================
+
+-- -------------------------
+-- 3.1 Customers & Identity
+-- -------------------------
+CREATE TABLE core.customers (
+    customer_id         UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    external_ref        TEXT UNIQUE, -- e.g. from IAM/IdP
+    email               CITEXT NOT NULL UNIQUE,
+    phone_e164          TEXT,
+    full_name           TEXT NOT NULL,
+    locale              TEXT NOT NULL DEFAULT 'en-US',
+    timezone            TEXT NOT NULL DEFAULT 'UTC',
+    created_at          TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at          TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    is_active           BOOLEAN NOT NULL DEFAULT TRUE,
+    deleted_at          TIMESTAMPTZ
+);
+
+CREATE INDEX ON core.customers (email);
+CREATE INDEX ON core.customers (created_at);
+
+-- -------------------------
+-- 3.2 Addresses
+-- -------------------------
+CREATE TABLE core.customer_addresses (
+    address_id          UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    customer_id         UUID NOT NULL REFERENCES core.customers(customer_id),
+    label               TEXT, -- "Home", "Office"
+    line1               TEXT NOT NULL,
+    line2               TEXT,
+    city                TEXT NOT NULL,
+    state_region        TEXT,
+    postal_code         TEXT,
+    country_iso2        CHAR(2) NOT NULL,
+    is_default_shipping BOOLEAN NOT NULL DEFAULT FALSE,
+    is_default_billing  BOOLEAN NOT NULL DEFAULT FALSE,
+    created_at          TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at          TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    deleted_at          TIMESTAMPTZ
+);
+
+CREATE INDEX ON core.customer_addresses (customer_id);
+CREATE INDEX ON core.customer_addresses (country_iso2);
+
+-- -------------------------
+-- 3.3 Product Catalog
+-- -------------------------
+CREATE TABLE core.brands (
+    brand_id    UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    name        TEXT NOT NULL UNIQUE,
+    created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE TABLE core.categories (
+    category_id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    parent_id   UUID REFERENCES core.categories(category_id),
+    name        TEXT NOT NULL,
+    created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    UNIQUE (parent_id, name)
+);
+
+CREATE TABLE core.products (
+    product_id      UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    sku             TEXT NOT NULL UNIQUE,
+    name            TEXT NOT NULL,
+    description     TEXT,
+    brand_id        UUID REFERENCES core.brands(brand_id),
+    category_id     UUID REFERENCES core.categories(category_id),
+    price_cents     BIGINT NOT NULL CHECK (price_cents >= 0),
+    currency        CHAR(3) NOT NULL,
+    is_active       BOOLEAN NOT NULL DEFAULT TRUE,
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    deleted_at      TIMESTAMPTZ
+);
+
+CREATE INDEX ON core.products (category_id);
+CREATE INDEX ON core.products (brand_id);
+CREATE INDEX ON core.products (is_active);
+
+-- -------------------------
+-- 3.4 Inventory (simplified)
+-- -------------------------
+CREATE TABLE core.inventory (
+    product_id      UUID PRIMARY KEY REFERENCES core.products(product_id),
+    quantity        BIGINT NOT NULL DEFAULT 0 CHECK (quantity >= 0),
+    updated_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+-- -------------------------
+-- 3.5 Orders & Order Items
+-- -------------------------
+CREATE TYPE core.order_status AS ENUM (
+    'PENDING_PAYMENT',
+    'PAID',
+    'SHIPPED',
+    'DELIVERED',
+    'CANCELLED',
+    'REFUNDED'
+);
+
+CREATE TABLE core.orders (
+    order_id            UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    customer_id         UUID NOT NULL REFERENCES core.customers(customer_id),
+    order_number        TEXT NOT NULL UNIQUE,
+    status              core.order_status NOT NULL DEFAULT 'PENDING_PAYMENT',
+    total_cents         BIGINT NOT NULL CHECK (total_cents >= 0),
+    currency            CHAR(3) NOT NULL,
+    shipping_address_id UUID REFERENCES core.customer_addresses(address_id),
+    billing_address_id  UUID REFERENCES core.customer_addresses(address_id),
+    created_at          TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at          TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX ON core.orders (customer_id);
+CREATE INDEX ON core.orders (status);
+CREATE INDEX ON core.orders (created_at);
+
+CREATE TABLE core.order_items (
+    order_item_id   UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    order_id        UUID NOT NULL REFERENCES core.orders(order_id) ON DELETE CASCADE,
+    product_id      UUID NOT NULL REFERENCES core.products(product_id),
+    quantity        INTEGER NOT NULL CHECK (quantity > 0),
+    unit_price_cents BIGINT NOT NULL CHECK (unit_price_cents >= 0),
+    currency        CHAR(3) NOT NULL,
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX ON core.order_items (order_id);
+CREATE INDEX ON core.order_items (product_id);
+
+-- -------------------------
+-- 3.6 Payments (tokenized)
+-- -------------------------
+CREATE TYPE core.payment_status AS ENUM (
+    'INITIATED',
+    'AUTHORIZED',
+    'CAPTURED',
+    'FAILED',
+    'REFUNDED'
+);
+
+CREATE TABLE core.payments (
+    payment_id          UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    order_id            UUID NOT NULL REFERENCES core.orders(order_id),
+    provider            TEXT NOT NULL, -- e.g. 'stripe', 'paypal'
+    provider_charge_id  TEXT NOT NULL, -- token from PSP
+    amount_cents        BIGINT NOT NULL CHECK (amount_cents >= 0),
+    currency            CHAR(3) NOT NULL,
+    status              core.payment_status NOT NULL,
+    created_at          TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at          TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX ON core.payments (order_id);
+CREATE INDEX ON core.payments (status);
+
+-- ============================================================================
+-- 4. AUDIT & EVENT LOGGING (APPEND-ONLY)
+-- ============================================================================
+
+CREATE TABLE audit.event_log (
+    event_id        BIGSERIAL PRIMARY KEY,
+    event_time      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    actor_type      TEXT NOT NULL, -- 'CUSTOMER', 'SYSTEM', 'ADMIN'
+    actor_id        TEXT,          -- could be UUID or external ID
+    event_type      TEXT NOT NULL, -- 'ORDER_CREATED', 'PAYMENT_CAPTURED', etc.
+    entity_type     TEXT NOT NULL, -- 'ORDER', 'CUSTOMER', 'PRODUCT', ...
+    entity_id       TEXT NOT NULL,
+    metadata        JSONB NOT NULL,
+    source_ip       INET,
+    user_agent      TEXT
+);
+
+CREATE INDEX ON audit.event_log (event_time);
+CREATE INDEX ON audit.event_log (actor_type, actor_id);
+CREATE INDEX ON audit.event_log (entity_type, entity_id);
+
+-- ============================================================================
+-- 5. ANALYTICS TABLES (FAVORITES, PREDICTIONS)
+-- ============================================================================
+
+-- -------------------------
+-- 5.1 Customer-product stats
+-- -------------------------
+CREATE TABLE analytics.customer_product_stats (
+    customer_id     UUID NOT NULL REFERENCES core.customers(customer_id),
+    product_id      UUID NOT NULL REFERENCES core.products(product_id),
+    order_count     BIGINT NOT NULL DEFAULT 0,
+    quantity_sum    BIGINT NOT NULL DEFAULT 0,
+    last_order_at   TIMESTAMPTZ,
+    PRIMARY KEY (customer_id, product_id)
+);
+
+-- -------------------------
+-- 5.2 Customer-category stats
+-- -------------------------
+CREATE TABLE analytics.customer_category_stats (
+    customer_id     UUID NOT NULL REFERENCES core.customers(customer_id),
+    category_id     UUID NOT NULL REFERENCES core.categories(category_id),
+    order_count     BIGINT NOT NULL DEFAULT 0,
+    quantity_sum    BIGINT NOT NULL DEFAULT 0,
+    last_order_at   TIMESTAMPTZ,
+    PRIMARY KEY (customer_id, category_id)
+);
+
+-- -------------------------
+-- 5.3 Customer-brand stats
+-- -------------------------
+CREATE TABLE analytics.customer_brand_stats (
+    customer_id     UUID NOT NULL REFERENCES core.customers(customer_id),
+    brand_id        UUID NOT NULL REFERENCES core.brands(brand_id),
+    order_count     BIGINT NOT NULL DEFAULT 0,
+    quantity_sum    BIGINT NOT NULL DEFAULT 0,
+    last_order_at   TIMESTAMPTZ,
+    PRIMARY KEY (customer_id, brand_id)
+);
+
+-- -------------------------
+-- 5.4 Views: favorites
+-- -------------------------
+CREATE VIEW analytics.customer_favorite_products AS
+SELECT
+    customer_id,
+    product_id,
+    quantity_sum,
+    order_count,
+    last_order_at,
+    RANK() OVER (PARTITION BY customer_id ORDER BY quantity_sum DESC, last_order_at DESC) AS rank_by_quantity
+FROM analytics.customer_product_stats;
+
+CREATE VIEW analytics.customer_favorite_categories AS
+SELECT
+    customer_id,
+    category_id,
+    quantity_sum,
+    order_count,
+    last_order_at,
+    RANK() OVER (PARTITION BY customer_id ORDER BY quantity_sum DESC, last_order_at DESC) AS rank_by_quantity
+FROM analytics.customer_category_stats;
+
+CREATE VIEW analytics.customer_favorite_brands AS
+SELECT
+    customer_id,
+    brand_id,
+    quantity_sum,
+    order_count,
+    last_order_at,
+    RANK() OVER (PARTITION BY customer_id ORDER BY quantity_sum DESC, last_order_at DESC) AS rank_by_quantity
+FROM analytics.customer_brand_stats;
+
+-- ============================================================================
+-- 6. LAMBDA-FRIENDLY FUNCTIONS
+--    - Order creation
+--    - Analytics updates
+--    - Recommendations
+-- ============================================================================
+
+-- -------------------------
+-- 6.1 Function: create_order_with_items
+--      - For use by Lambda to atomically create an order + items
+--      - Expects JSONB payload for items
+-- -------------------------
+-- items_json format:
+-- [
+--   { "product_id": "uuid", "quantity": 2, "unit_price_cents": 1000, "currency": "USD" },
+--   ...
+-- ]
+CREATE OR REPLACE FUNCTION core.create_order_with_items(
+    p_customer_id        UUID,
+    p_order_number       TEXT,
+    p_currency           CHAR(3),
+    p_shipping_address_id UUID,
+    p_billing_address_id  UUID,
+    p_items_json         JSONB
+)
+RETURNS UUID
+LANGUAGE plpgsql
+AS $$
+DECLARE
+    v_order_id      UUID;
+    v_total_cents   BIGINT := 0;
+    v_item          JSONB;
+    v_product_id    UUID;
+    v_quantity      INTEGER;
+    v_unit_price    BIGINT;
+    v_currency_item CHAR(3);
+BEGIN
+    -- Calculate total
+    FOR v_item IN SELECT * FROM jsonb_array_elements(p_items_json)
+    LOOP
+        v_product_id    := (v_item->>'product_id')::UUID;
+        v_quantity      := (v_item->>'quantity')::INTEGER;
+        v_unit_price    := (v_item->>'unit_price_cents')::BIGINT;
+        v_currency_item := (v_item->>'currency')::CHAR(3);
+
+        IF v_currency_item <> p_currency THEN
+            RAISE EXCEPTION 'Currency mismatch for product %', v_product_id;
+        END IF;
+
+        v_total_cents := v_total_cents + (v_unit_price * v_quantity);
+    END LOOP;
+
+    INSERT INTO core.orders (
+        customer_id,
+        order_number,
+        status,
+        total_cents,
+        currency,
+        shipping_address_id,
+        billing_address_id
+    ) VALUES (
+        p_customer_id,
+        p_order_number,
+        'PENDING_PAYMENT',
+        v_total_cents,
+        p_currency,
+        p_shipping_address_id,
+        p_billing_address_id
+    )
+    RETURNING order_id INTO v_order_id;
+
+    -- Insert items
+    FOR v_item IN SELECT * FROM jsonb_array_elements(p_items_json)
+    LOOP
+        v_product_id    := (v_item->>'product_id')::UUID;
+        v_quantity      := (v_item->>'quantity')::INTEGER;
+        v_unit_price    := (v_item->>'unit_price_cents')::BIGINT;
+        v_currency_item := (v_item->>'currency')::CHAR(3);
+
+        INSERT INTO core.order_items (
+            order_id,
+            product_id,
+            quantity,
+            unit_price_cents,
+            currency
+        ) VALUES (
+            v_order_id,
+            v_product_id,
+            v_quantity,
+            v_unit_price,
+            v_currency_item
+        );
+    END LOOP;
+
+    -- Audit event
+    INSERT INTO audit.event_log (
+        actor_type,
+        actor_id,
+        event_type,
+        entity_type,
+        entity_id,
+        metadata
+    ) VALUES (
+        'CUSTOMER',
+        p_customer_id::TEXT,
+        'ORDER_CREATED',
+        'ORDER',
+        v_order_id::TEXT,
+        jsonb_build_object(
+            'order_id', v_order_id,
+            'order_number', p_order_number,
+            'total_cents', v_total_cents,
+            'currency', p_currency
+        )
+    );
+
+    RETURN v_order_id;
+END;
+$$;
+
+-- -------------------------
+-- 6.2 Function: mark_order_paid_and_update_analytics
+--      - Called after successful payment capture
+-- -------------------------
+CREATE OR REPLACE FUNCTION core.mark_order_paid_and_update_analytics(
+    p_order_id      UUID,
+    p_payment_id    UUID,
+    p_actor_id      TEXT
+)
+RETURNS VOID
+LANGUAGE plpgsql
+AS $$
+DECLARE
+    v_customer_id   UUID;
+    v_now           TIMESTAMPTZ := NOW();
+    v_item          RECORD;
+    v_category_id   UUID;
+    v_brand_id      UUID;
+BEGIN
+    SELECT customer_id INTO v_customer_id
+    FROM core.orders
+    WHERE order_id = p_order_id
+    FOR UPDATE;
+
+    UPDATE core.orders
+    SET status = 'PAID',
+        updated_at = v_now
+    WHERE order_id = p_order_id;
+
+    -- Audit event
+    INSERT INTO audit.event_log (
+        actor_type,
+        actor_id,
+        event_type,
+        entity_type,
+        entity_id,
+        metadata
+    ) VALUES (
+        'SYSTEM',
+        p_actor_id,
+        'ORDER_PAID',
+        'ORDER',
+        p_order_id::TEXT,
+        jsonb_build_object(
+            'order_id', p_order_id,
+            'payment_id', p_payment_id
+        )
+    );
+
+    -- Update analytics tables
+    FOR v_item IN
+        SELECT
+            oi.product_id,
+            oi.quantity,
+            p.category_id,
+            p.brand_id
+        FROM core.order_items oi
+        JOIN core.products p ON p.product_id = oi.product_id
+        WHERE oi.order_id = p_order_id
+    LOOP
+        -- Product stats
+        INSERT INTO analytics.customer_product_stats AS cps (
+            customer_id, product_id, order_count, quantity_sum, last_order_at
+        ) VALUES (
+            v_customer_id, v_item.product_id, 1, v_item.quantity, v_now
+        )
+        ON CONFLICT (customer_id, product_id) DO UPDATE
+        SET order_count   = cps.order_count + 1,
+            quantity_sum  = cps.quantity_sum + EXCLUDED.quantity_sum,
+            last_order_at = v_now;
+
+        -- Category stats
+        IF v_item.category_id IS NOT NULL THEN
+            INSERT INTO analytics.customer_category_stats AS ccs (
+                customer_id, category_id, order_count, quantity_sum, last_order_at
+            ) VALUES (
+                v_customer_id, v_item.category_id, 1, v_item.quantity, v_now
+            )
+            ON CONFLICT (customer_id, category_id) DO UPDATE
+            SET order_count   = ccs.order_count + 1,
+                quantity_sum  = ccs.quantity_sum + EXCLUDED.quantity_sum,
+                last_order_at = v_now;
+        END IF;
+
+        -- Brand stats
+        IF v_item.brand_id IS NOT NULL THEN
+            INSERT INTO analytics.customer_brand_stats AS cbs (
+                customer_id, brand_id, order_count, quantity_sum, last_order_at
+            ) VALUES (
+                v_customer_id, v_item.brand_id, 1, v_item.quantity, v_now
+            )
+            ON CONFLICT (customer_id, brand_id) DO UPDATE
+            SET order_count   = cbs.order_count + 1,
+                quantity_sum  = cbs.quantity_sum + EXCLUDED.quantity_sum,
+                last_order_at = v_now;
+        END IF;
+    END LOOP;
+END;
+$$;
+
+-- -------------------------
+-- 6.3 Function: get_recommended_products_for_customer
+--      - Simple heuristic: top categories/brands not yet purchased recently
+--      - Lambda can call this directly
+-- -------------------------
+CREATE OR REPLACE FUNCTION analytics.get_recommended_products_for_customer(
+    p_customer_id      UUID,
+    p_limit            INTEGER DEFAULT 20
+)
+RETURNS TABLE (
+    product_id      UUID,
+    name            TEXT,
+    brand_name      TEXT,
+    category_name   TEXT,
+    score           NUMERIC
+)
+LANGUAGE sql
+AS $$
+WITH fav_cats AS (
+    SELECT category_id, quantity_sum
+    FROM analytics.customer_category_stats
+    WHERE customer_id = p_customer_id
+    ORDER BY quantity_sum DESC
+    LIMIT 5
+),
+fav_brands AS (
+    SELECT brand_id, quantity_sum
+    FROM analytics.customer_brand_stats
+    WHERE customer_id = p_customer_id
+    ORDER BY quantity_sum DESC
+    LIMIT 5
+),
+scores AS (
+    SELECT
+        p.product_id,
+        p.name,
+        b.name AS brand_name,
+        c.name AS category_name,
+        COALESCE(fc.quantity_sum, 0) * 1.0 AS cat_score,
+        COALESCE(fb.quantity_sum, 0) * 1.0 AS brand_score
+    FROM core.products p
+    LEFT JOIN core.brands b ON b.brand_id = p.brand_id
+    LEFT JOIN core.categories c ON c.category_id = p.category_id
+    LEFT JOIN fav_cats fc ON fc.category_id = p.category_id
+    LEFT JOIN fav_brands fb ON fb.brand_id = p.brand_id
+    WHERE p.is_active = TRUE
+)
+SELECT
+    product_id,
+    name,
+    brand_name,
+    category_name,
+    (cat_score * 0.6 + brand_score * 0.4) AS score
+FROM scores
+WHERE (cat_score > 0 OR brand_score > 0)
+ORDER BY score DESC
+LIMIT p_limit;
+$$;
+
+-- ============================================================================
+-- 7. SECURITY & COMPLIANCE HOOKS (RLS SKELETON)
+--    - Actual policies depend on your IAM / auth model
+-- ============================================================================
+
+-- Example: enable RLS on customers and orders
+ALTER TABLE core.customers ENABLE ROW LEVEL SECURITY;
+ALTER TABLE core.orders ENABLE ROW LEVEL SECURITY;
+
+-- Example policies (to be adapted to your auth model):
+-- Assume current_setting('app.current_customer_id') holds the UUID of the caller.
+
+CREATE POLICY customer_self_access ON core.customers
+    USING (customer_id::TEXT = current_setting('app.current_customer_id', true));
+
+CREATE POLICY customer_order_access ON core.orders
+    USING (customer_id::TEXT = current_setting('app.current_customer_id', true));
+
+-- For Lambda, you can set:
+--   SET app.current_customer_id = '<uuid>';
+-- before queries, based on JWT / Cognito / custom auth.
+
+-- ============================================================================
+-- END OF SCRIPT
+-- ============================================================================
